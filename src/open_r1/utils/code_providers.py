@@ -17,6 +17,12 @@
 
 import abc
 import asyncio
+import concurrent.futures
+import os
+import subprocess
+import tempfile
+import textwrap
+from pathlib import Path
 from typing import List, Optional
 
 from ..utils import is_e2b_available, is_morph_available
@@ -95,14 +101,7 @@ class E2BProvider(CodeExecutionProvider):
                 request_timeout=28,
             )
 
-            rewards = []
-            for execution in executions:
-                try:
-                    reward = float(execution.text)
-                    rewards.append(reward)
-                except Exception:
-                    rewards.append(None)
-            return rewards
+            return [self._extract_reward(execution) for execution in executions]
 
         try:
             rewards = self._run_async_from_sync(scripts, languages, self.num_parallel)
@@ -115,7 +114,25 @@ class E2BProvider(CodeExecutionProvider):
     def _run_async_from_sync(self, scripts: List[str], languages: List[str], num_parallel: int) -> List[float]:
         """Function wrapping the `_run_async` function."""
         try:
-            rewards = asyncio.run(self._run_async(scripts, languages, num_parallel))
+            # Keep a reusable event loop for repeated reward calls during training.
+            # `asyncio.run` creates/closes loops and can trigger "Event loop is closed"
+            # issues in some client libraries across consecutive invocations.
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    raise RuntimeError("event loop is closed")
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            if loop.is_running():
+                temp_loop = asyncio.new_event_loop()
+                try:
+                    rewards = temp_loop.run_until_complete(self._run_async(scripts, languages, num_parallel))
+                finally:
+                    temp_loop.close()
+            else:
+                rewards = loop.run_until_complete(self._run_async(scripts, languages, num_parallel))
         except Exception as e:
             print(f"Error from E2B executor async: {e}")
             raise e
@@ -125,14 +142,14 @@ class E2BProvider(CodeExecutionProvider):
     async def _run_async(self, scripts: List[str], languages: List[str], num_parallel: int) -> List[float]:
         semaphore = asyncio.Semaphore(num_parallel)
 
-        tasks = [self._run_script(script, languages, semaphore) for script in scripts]
+        tasks = [self._run_script(script, language, semaphore) for script, language in zip(scripts, languages)]
 
         results = await asyncio.gather(*tasks)
         rewards = list(results)
 
         return rewards
 
-    async def _run_script(self, script: str, languages: List[str], semaphore: asyncio.Semaphore) -> float:
+    async def _run_script(self, script: str, language: str, semaphore: asyncio.Semaphore) -> float:
         # We set a timeout margin, as the AsyncSandbox timeout does not seem to work
         # These values are based on running 256 examples with the gold solution
         # from open-r1/verifiable-coding-problems-python_decontaminated
@@ -143,27 +160,74 @@ class E2BProvider(CodeExecutionProvider):
         REQUEST_TIMEOUT = SANDBOX_TIMEOUT - MARGIN
         ASYNCIO_TIMEOUT = SANDBOX_TIMEOUT + MARGIN
 
+        sandbox = None
         async with semaphore:
             try:
                 sandbox = await AsyncSandbox.create(timeout=SANDBOX_TIMEOUT, request_timeout=REQUEST_TIMEOUT)
-                execution = await asyncio.wait_for(
-                    sandbox.run_code(script, languages=languages),
-                    timeout=ASYNCIO_TIMEOUT,
-                )
-                return float(execution.text)
+                # e2b-code-interpreter changed from `languages=` (old) to `language=` (new).
+                try:
+                    execution = await asyncio.wait_for(
+                        sandbox.run_code(script, language=language),
+                        timeout=ASYNCIO_TIMEOUT,
+                    )
+                except TypeError:
+                    execution = await asyncio.wait_for(
+                        sandbox.run_code(script, languages=[language]),
+                        timeout=ASYNCIO_TIMEOUT,
+                    )
+                return self._extract_reward(execution)
             except (TypeError, ValueError):
                 return 0.0
             except asyncio.TimeoutError:
                 print("Operation timed out")
                 return 0.0
             except Exception as e:
-                print(f"Error in `_run_script` from E2B sandbox ID {sandbox.sandbox_id} : {e}")
+                sandbox_id = getattr(sandbox, "sandbox_id", "unknown")
+                print(f"Error in `_run_script` from E2B sandbox ID {sandbox_id} : {e}")
                 return 0.0
             finally:
-                try:
-                    await sandbox.kill()
-                except Exception as e:
-                    print(f"Error from E2B executor kill with sandbox ID {sandbox.sandbox_id} : {e}")
+                if sandbox is not None:
+                    try:
+                        await sandbox.kill()
+                    except Exception as e:
+                        sandbox_id = getattr(sandbox, "sandbox_id", "unknown")
+                        print(f"Error from E2B executor kill with sandbox ID {sandbox_id} : {e}")
+
+    @staticmethod
+    def _extract_reward(execution) -> float:
+        """Extract float reward from different E2B execution result formats."""
+        if execution is None:
+            return 0.0
+
+        # e2b v1 style
+        text = getattr(execution, "text", None)
+        if text not in (None, ""):
+            try:
+                return float(str(text).strip().splitlines()[-1])
+            except (TypeError, ValueError):
+                pass
+
+        # e2b v2 style: results list
+        results = getattr(execution, "results", None)
+        if results:
+            try:
+                result_text = getattr(results[-1], "text", None)
+                if result_text not in (None, ""):
+                    return float(str(result_text).strip().splitlines()[-1])
+            except (TypeError, ValueError, IndexError):
+                pass
+
+        # fallback: parse stdout logs
+        logs = getattr(execution, "logs", None)
+        stdout = getattr(logs, "stdout", None) if logs is not None else getattr(execution, "stdout", None)
+        if stdout:
+            try:
+                output = "".join(stdout) if isinstance(stdout, list) else str(stdout)
+                return float(output.strip().splitlines()[-1])
+            except (TypeError, ValueError):
+                pass
+
+        return 0.0
 
 
 class MorphProvider(CodeExecutionProvider):
@@ -336,11 +400,123 @@ class MorphProvider(CodeExecutionProvider):
                         pass
 
 
+class LocalDockerProvider(CodeExecutionProvider):
+    """Provider that executes code in hardened local Docker sandboxes."""
+
+    def __init__(
+        self,
+        num_parallel: int = 2,
+        docker_image: Optional[str] = None,
+        timeout: int = 30,
+        memory_limit: str = "512m",
+        cpu_limit: str = "1.0",
+        pids_limit: int = 64,
+    ):
+        self.num_parallel = max(1, num_parallel)
+        self.docker_image = docker_image or os.getenv("LOCAL_CODE_DOCKER_IMAGE", "python:3.11-slim")
+        self.timeout = int(os.getenv("LOCAL_CODE_TIMEOUT_SEC", str(timeout)))
+        self.memory_limit = os.getenv("LOCAL_CODE_MEMORY_LIMIT", memory_limit)
+        self.cpu_limit = os.getenv("LOCAL_CODE_CPU_LIMIT", cpu_limit)
+        self.pids_limit = int(os.getenv("LOCAL_CODE_PIDS_LIMIT", str(pids_limit)))
+
+    def execute_scripts(self, scripts: List[str], languages: List[str]) -> List[float]:
+        if len(scripts) != len(languages):
+            raise ValueError("scripts and languages must have the same length")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_parallel) as executor:
+            futures = [executor.submit(self._execute_script, script, language) for script, language in zip(scripts, languages)]
+            return [future.result() for future in futures]
+
+    def _execute_script(self, script: str, language: str) -> float:
+        if language.lower() != "python":
+            # The current code reward pipeline executes Python snippets.
+            return 0.0
+
+        script = self._prepare_script(script)
+
+        with tempfile.TemporaryDirectory(prefix="open_r1_local_exec_") as tmpdir:
+            os.chmod(tmpdir, 0o755)
+            script_path = Path(tmpdir) / "script.py"
+            script_path.write_text(script, encoding="utf-8")
+            os.chmod(script_path, 0o644)
+
+            cmd = self._build_docker_cmd(script_path)
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout + 5,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                return 0.0
+
+            if completed.returncode != 0:
+                return 0.0
+
+            return self._parse_reward(completed.stdout)
+
+    def _build_docker_cmd(self, script_path: Path) -> List[str]:
+        script_path = script_path.resolve()
+        mount_src = str(script_path.parent)
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--pids-limit",
+            str(self.pids_limit),
+            "--memory",
+            self.memory_limit,
+            "--cpus",
+            str(self.cpu_limit),
+            "--user",
+            "65534:65534",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev,size=64m",
+            "--mount",
+            f"type=bind,src={mount_src},dst=/workspace,readonly",
+            "--workdir",
+            "/tmp",
+            "--env",
+            "PYTHONDONTWRITEBYTECODE=1",
+            self.docker_image,
+            "python3",
+            "-B",
+            "/workspace/script.py",
+        ]
+
+    @staticmethod
+    def _prepare_script(script: str) -> str:
+        script = textwrap.dedent(script)
+        marker = "evaluate_code(code_snippet, test_cases)"
+        if marker in script and f"print({marker})" not in script:
+            script = script.replace(marker, f"print({marker})")
+        return script
+
+    @staticmethod
+    def _parse_reward(stdout: str) -> float:
+        if not stdout:
+            return 0.0
+        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if not lines:
+            return 0.0
+        try:
+            return float(lines[-1])
+        except ValueError:
+            return 0.0
+
+
 def get_provider(provider_type: str = "e2b", **kwargs) -> CodeExecutionProvider:
     """Factory function to get the appropriate code execution provider.
 
     Args:
-        provider_type: Type of provider to use ("e2b", "morph")
+        provider_type: Type of provider to use ("e2b", "morph", "local")
         **kwargs: Additional arguments to pass to the provider
 
     Returns:
@@ -361,6 +537,15 @@ def get_provider(provider_type: str = "e2b", **kwargs) -> CodeExecutionProvider:
         return MorphProvider(
             num_parallel=num_parallel,
             morph_router_url=morph_router_url,
+        )
+    elif provider_type == "local":
+        return LocalDockerProvider(
+            num_parallel=num_parallel,
+            docker_image=kwargs.pop("local_docker_image", None),
+            timeout=kwargs.pop("local_timeout", 30),
+            memory_limit=kwargs.pop("local_memory_limit", "512m"),
+            cpu_limit=kwargs.pop("local_cpu_limit", "1.0"),
+            pids_limit=kwargs.pop("local_pids_limit", 64),
         )
     else:
         raise ValueError(f"Unknown provider type: {provider_type}")
